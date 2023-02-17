@@ -1,0 +1,167 @@
+import { createBullBoard } from "@bull-board/api";
+import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
+import { HapiAdapter } from "@bull-board/hapi";
+import Basic from "@hapi/basic";
+import { Boom } from "@hapi/boom";
+import Hapi from "@hapi/hapi";
+import Inert from "@hapi/inert";
+import Vision from "@hapi/vision";
+import HapiPulse from "hapi-pulse";
+import HapiSwagger from "hapi-swagger";
+import _ from "lodash";
+import qs from "qs";
+
+import { setupRoutes } from "@/api/routes";
+import { logger } from "@/common/logger";
+import { config } from "@/config/index";
+import { getNetworkName } from "@/config/network";
+
+import { allJobQueues, gracefulShutdownJobWorkers } from "@/jobs/index";
+
+
+let server: Hapi.Server;
+
+export const inject = (options: Hapi.ServerInjectOptions) => server.inject(options);
+
+export const start = async (): Promise<void> => {
+  server = Hapi.server({
+    port: config.port,
+    query: {
+      parser: (query) => qs.parse(query),
+    },
+    router: {
+      stripTrailingSlash: true,
+    },
+    routes: {
+      cache: {
+        privacy: "public",
+        expiresIn: 1000,
+      },
+      timeout: {
+        server: 10 * 1000,
+      },
+      cors: {
+        origin: ["*"],
+        additionalHeaders: ["x-api-key", "x-rkc-version", "x-rkui-version"],
+      },
+      // Expose any validation errors
+      // https://github.com/hapijs/hapi/issues/3706
+      validate: {
+        options: {
+          stripUnknown: true,
+        },
+        failAction: (_request, _h, error) => {
+          // Remove any irrelevant information from the response
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          delete (error as any).output.payload.validation;
+          throw error;
+        },
+      },
+    },
+  });
+
+  // Register an authentication strategy for the BullMQ monitoring UI
+  await server.register(Basic);
+  server.auth.strategy("simple", "basic", {
+    validate: (_request: Hapi.Request, username: string, password: string) => {
+      return {
+        isValid: username === "admin" && password === config.bullmqAdminPassword,
+        credentials: { username },
+      };
+    },
+  });
+
+  // Setup the BullMQ monitoring UI
+  const serverAdapter = new HapiAdapter();
+  createBullBoard({
+    queues: allJobQueues.map((q) => new BullMQAdapter(q)),
+    serverAdapter,
+  });
+
+  const apiDescription =
+    "You are viewing the reference docs for the Reservoir API.\
+    \
+    For a more complete overview with guides and examples, check out the <a href='https://reservoirprotocol.github.io'>Reservoir Protocol Docs</a>.";
+
+  await server.register([
+    {
+      plugin: Inert,
+    },
+    {
+      plugin: Vision,
+    },
+    {
+      plugin: HapiSwagger,
+      options: <HapiSwagger.RegisterOptions>{
+        grouping: "tags",
+        security: [{ API_KEY: [] }],
+        securityDefinitions: {
+          API_KEY: {
+            type: "apiKey",
+            name: "x-api-key",
+            in: "header",
+            "x-default": "demo-api-key",
+          },
+        },
+        schemes: ["https", "http"],
+        host: `${config.chainId === 1 ? "api" : `api-${getNetworkName()}`}.reservoir.tools`,
+        cors: true,
+        tryItOutEnabled: true,
+        documentationPath: "/",
+        sortEndpoints: "ordered",
+        info: {
+          title: "Reservoir API",
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          version: require("../../package.json").version,
+          description: apiDescription,
+        },
+      },
+    },
+    {
+      plugin: HapiPulse,
+      options: {
+        timeout: 25 * 1000,
+        signals: ["SIGINT", "SIGTERM"],
+        preServerStop: async () => {
+          logger.info("process", "Shutting down");
+
+          // Close all workers which should be gracefully shutdown
+          await Promise.all(gracefulShutdownJobWorkers.map((worker:any) => worker?.close()));
+        },
+      },
+    },
+  ]);
+
+  server.ext("onPreResponse", (request, reply) => {
+    const response = request.response;
+
+    // Set custom response in case of timeout
+    if ("isBoom" in response && "output" in response) {
+      if (response["output"]["statusCode"] == 503) {
+        const timeoutResponse = {
+          statusCode: 504,
+          error: "Gateway Timeout",
+          message: "Query cancelled because it took longer than 10s to execute",
+        };
+
+        return reply.response(timeoutResponse).type("application/json").code(504);
+      }
+
+    }
+
+    if (!(response instanceof Boom)) {
+      response.header("X-RateLimit-Limit", request.headers["X-RateLimit-Limit"]);
+      response.header("X-RateLimit-Remaining", request.headers["X-RateLimit-Remaining"]);
+      response.header("X-RateLimit-Reset", request.headers["X-RateLimit-Reset"]);
+    }
+
+    return reply.continue;
+  });
+
+  setupRoutes(server);
+
+  server.listener.keepAliveTimeout = 61000;
+
+  await server.start();
+  logger.info("process", `Started on port ${config.port}`);
+};

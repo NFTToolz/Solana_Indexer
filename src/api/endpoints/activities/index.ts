@@ -1,0 +1,1 @@
+export * from "@/api/endpoints/activities/get-collection-activity/v1";
